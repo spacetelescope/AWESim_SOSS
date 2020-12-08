@@ -27,3 +27,25 @@ def test_generate_SOSS_ldcs():
 
     # Make sure 2 coefficients are returned (for quadratic profile)
     assert len(lookup[0]) == 2
+
+
+def test_get_angle():
+    """Test for the get_angle function"""
+    coords = 2, 2
+    angle = mt.get_angle(coords)
+
+    assert isinstance(angle, float)
+
+
+def test_get_SOSS_psf():
+    """Test for the get_SOSS_psf function"""
+    psf = mt.get_SOSS_psf(1)
+
+    assert psf.ndim == 2
+
+
+def test_psf_tilts():
+    """Test for the psf_tilts function"""
+    tilts = mt.psf_tilts(1)
+
+    assert len(tilts) == 2048

@@ -115,18 +115,13 @@ been changed and a couple of the defaults have been changed as well.
 from copy import copy
 import datetime
 import math
-import os
-from pkg_resources import resource_filename
 import warnings
 
-from astropy.io import fits
-from astropy.stats.funcs import median_absolute_deviation as mad
-import astropy.table as at
 from hotsoss import utils
 import numpy as np
 from scipy.ndimage.interpolation import zoom
 
-from .jwst_utils import SUB_SLICE, SUB_DIMS, add_refpix
+from .jwst_utils import SUB_SLICE, add_refpix
 
 warnings.filterwarnings('ignore')
 
@@ -196,48 +191,86 @@ def add_signal(signals, cube, pyimage, frametime, gain, zodi, zodi_scale, photon
     return newcube
 
 
-def add_nonlinearity(cube, nonlinearity, offset=0):
+def unlinearize(image, nonlinearity, sat, maxiter=10, accuracy=0.000001):
     """
-    Add pixel nonlinearity effects to the ramp using the procedure outlined in
-    /grp/jwst/wit/niriss/CDP-2/documentation/niriss_linearity.docx
+    Add non linearity to the ramp images
+    Modified from Bryan Hilbert's code: https://github.com/spacetelescope/mirage/blob/master/mirage/ramp_generator/unlinearize.py
 
     Parameters
     ----------
-    cube: sequence
-        The ramp with no non-linearity
-    nonlinearity: sequence
-        The non-linearity image to add to the ramp
-    offset: int
-        The non-linearity offset
+    image: array-like
+        The image to unlinearize
+    nonlinearity: array-like
+        The 3D coefficients from the nonlinearity reference file
+    sat: array-like
+        Saturation map for the nonlinear ramps
+    maxiter: int
+        The maximum iterations
+    accuracy: float
+        The allowed accuracy
 
     Returns
     -------
     np.ndarray
-        The ramp with the added non-linearity
+        The unlinearized ramp data
     """
-    # Get the cube shape
-    shape = cube.shape
+    # Check if the sizes of the satmap or coeffs are different than the data
+    if sat.shape != image.shape[-2:]:
+        raise ValueError(("WARNING: image y,x shape is {}, but input saturation map shape is {}.".format(image.shape[-2:], sat.shape)))
 
-    # Transpose linearity coefficient array
+    # Get the image shape
+    shape = image.shape
+
+    # Transpose linearity coefficient array (x and y switched in ref file)
+    # Reverse coefficients, x, and y dimensions (all 3 are backwards in ref file)
+    # Trim coeffs to subarray (ref file is FULL frame)
     coeffs = np.transpose(nonlinearity, (0, 2, 1))
-
-    # Reverse coefficients, x, and y dimensions
     coeffs = coeffs[::-1, ::-1, ::-1]
-
-    # Trim coeffs to subarray (nonlinearity ref file is FULL frame)
     sl = SUB_SLICE['SUBSTRIP256' if shape[1] == 256 else 'SUBSTRIP96' if shape[1] == 96 else 'FULL']
     coeffs = coeffs[:, sl, :]
 
-    # Make a new array for the ramp + non-linearity and subtract offset
-    newcube = cube - offset
+    # REWORK SO THAT THE LINARIZED SATURATION MAP IS AN INPUT
+    # RATHER THAN BEING CREATED HERE. THIS IS BECAUSE THE SUPERBIAS
+    # AND REFPIX SIGNALS MUST BE SUBTRACTED BEFORE LINEARIZING
+    # THE ORIGINAL RAW SATURATION MAP
 
-    # Evaluate polynomial at each pixel
-    newcube = np.polyval(coeffs, newcube)
+    # Translate to saturation maps for the linear ramps here so
+    # that we can pay attention only to non-saturated pixels in
+    # the input linear image. Do this by applying the standard
+    # linearity correction to the saturation map
+    lin_satmap = nonLinFunc(sat, coeffs, sat)
 
-    # Put offset back in
-    newcube += offset
+    # Find pixels with "good" signals, to have the nonlin applied.
+    # Negative pix or pix with signals above the requested max
+    # value will not be changed.
+    x = np.copy(image)
+    i1 = np.where((image > 0.) & (image < lin_satmap))
+    dev = np.zeros_like(image, dtype=float)
+    dev[i1] = 1.
+    i2 = np.where((image <= 0.) | (image >= lin_satmap))
+    numhigh = np.where(image >= lin_satmap)
+    i = 0
 
-    return newcube
+    # Initial run of the nonlin function - when calling the
+    # non-lin function, give the original satmap for the
+    # non-linear signal values
+    val = nonLinFunc(image, coeffs, sat)
+    val[i2] = 1.
+
+    x[i1] = (image[i1] + image[i1] / val[i1]) / 2.
+    while i < maxiter:
+        i = i + 1
+        val = nonLinFunc(x, coeffs, sat)
+        val[i2] = 1.
+        dev[i1] = np.abs(image[i1] / val[i1] - 1.)
+        inds = np.where(dev[i1] > accuracy)
+        if inds[0].size < 1:
+            break
+        val1 = nonLinDeriv(x, coeffs, sat)
+        val1[i2] = 1.
+        x[i1] = x[i1] + (image[i1] - val[i1]) / val1[i1]
+
+    return x
 
 
 class HXRGNoise:
@@ -475,7 +508,7 @@ class HXRGNoise:
 
         return(result)
 
-    def mknoise(self, rd_noise=5.0, pedestal_drift=4, c_pink=3, u_pink=1, acn=0.5, gain=1., superbias=None, reference_pixel_noise_ratio=0.8, ktc_noise=29., bias_offset=20994.06, bias_amp=5358.87, dark_current=None, dc_seed=0, noise_seed=0):
+    def mknoise(self, rd_noise=5.0, pedestal_drift=4, c_pink=3, u_pink=1, acn=0.5, gain=1., superbias=None, reference_pixel_noise_ratio=0.8, ktc_noise=29., bias_offset=20994.06, bias_amp=5358.87, dark_current=None, dc_seed=0, noise_seed=0, skip=[]):
         """
         Generate a FITS cube containing only noise and the optional dark signal.
 
@@ -523,6 +556,8 @@ class HXRGNoise:
             Gain value in electrons/ADU
         noise_seed: float
             Seed value for the noise generation, to allow a simulation to be repeated
+        skip: sequence
+            The names of the noise sources to skip
 
         Returns
         -------
@@ -561,12 +596,16 @@ class HXRGNoise:
         darkgen = np.random.default_rng(rseed2)
 
         # Initialize the result cube
-        self.message('Initializing results cube')
         result = np.zeros((self.ngrps, self.ncols, self.nrows), dtype=np.float32)
 
-        if self.ngrps > 1:
+        # ==========================================================================
+        # bias_pattern =============================================================
+        # ==========================================================================
+        if 'bias_pattern' not in skip:
 
-            # Always inject bias pattern. Works for WINDOW and STRIPE (JML)
+            self.message('Adding bias_pattern')
+
+            # Inject the bias pattern. Works for WINDOW and STRIPE (JML)
             bias_pattern = self.pca0 * self.bias_amp + self.bias_offset
 
             # Add in some kTC noise. Since this should always come out
@@ -577,14 +616,23 @@ class HXRGNoise:
             for z in np.arange(self.ngrps):
                 result[z, :, :] += bias_pattern
 
-            # Save it
-            self.noise_sources['bias_pattern'].append(self.noise_stats(result - bias_pattern))
-            del bias_pattern
+        else:
 
+            self.message('Skipping bias_pattern')
+            bias_pattern = np.zeros_like(result)
+
+        # Save it
+        self.noise_sources['bias_pattern'].append(self.noise_stats(result - bias_pattern))
+        del bias_pattern
+
+        # ==========================================================================
+        # read_noise ===============================================================
+        # ==========================================================================
         # Make white read noise. This is the same for all pixels.
-        if self.rd_noise > 0:
-            self.message('Generating rd_noise')
-            pre_rdnoise = copy(result)
+        pre_rdnoise = copy(result)
+        if self.rd_noise > 0 and 'read_noise' not in skip:
+
+            self.message('Adding read_noise')
             w = self.ref_all
             r = self.reference_pixel_noise_ratio
             for z in np.arange(self.ngrps):
@@ -609,14 +657,21 @@ class HXRGNoise:
                 # Add the noise in to the result
                 result[z, :, :] += read_noise
 
-            # Save it
-            self.noise_sources['read_noise'].append(self.noise_stats(result - pre_rdnoise))
-            del read_noise, pre_rdnoise
+        else:
 
+            self.message('Skipping read_noise')
+
+        # Save it
+        self.noise_sources['read_noise'].append(self.noise_stats(result - pre_rdnoise))
+        del pre_rdnoise
+
+        # ==========================================================================
+        # corr_pink_noise ==========================================================
+        # ==========================================================================
         # Add correlated pink noise.
-        if self.c_pink > 0:
-            self.message('Adding c_pink noise')
-            pre_cpink = copy(result)
+        pre_cpink = copy(result)
+        if self.c_pink > 0 and 'corr_pink_noise' not in skip:
+            self.message('Adding corr_pink_noise noise')
             corr_pink = self.c_pink * self.pink_noise(mygen, 'pink')
             corr_pink = np.reshape(corr_pink, (self.ngrps, self.ncols + self.nfoh, self.xsize + self.nroh))[:, :self.ncols, :self.xsize]
             for op in np.arange(self.n_out):
@@ -632,15 +687,22 @@ class HXRGNoise:
                 else:
                     result[:, :, x0:x1] += corr_pink[:, :, ::-1]
 
-            # Save it
-            self.noise_sources['corr_pink_noise'].append(self.noise_stats(result - pre_cpink))
-            del corr_pink, pre_cpink
+        else:
 
+            self.message('Skipping corr_pink_noise')
+
+        # Save it
+        self.noise_sources['corr_pink_noise'].append(self.noise_stats(result - pre_cpink))
+        del pre_cpink
+
+        # ==========================================================================
+        # uncorr_pink_noise ========================================================
+        # ==========================================================================
         # Add uncorrelated pink noise. Because this pink noise is stationary and
         # different for each output, we don't need to flip it.
-        if self.u_pink > 0:
-            self.message('Adding u_pink noise')
-            pre_upink = copy(result)
+        pre_upink = copy(result)
+        if self.u_pink > 0 and 'uncorr_pink_noise' not in skip:
+            self.message('Adding uncorr_pink_noise noise')
             for op in np.arange(self.n_out):
                 x0 = op * self.xsize
                 x1 = x0 + self.xsize
@@ -648,14 +710,21 @@ class HXRGNoise:
                 uncorr_pink = np.reshape(uncorr_pink, (self.ngrps, self.ncols + self.nfoh, self.xsize + self.nroh))[:, :self.ncols, :self.xsize]
                 result[:, :, x0:x1] += uncorr_pink
 
-            # Save it
-            self.noise_sources['uncorr_pink_noise'].append(self.noise_stats(result - pre_upink))
-            del pre_upink
+        else:
 
+            self.message('Skipping uncorr_pink_noise')
+
+        # Save it
+        self.noise_sources['uncorr_pink_noise'].append(self.noise_stats(result - pre_upink))
+        del pre_upink
+
+        # ==========================================================================
+        # alt_col_noise ============================================================
+        # ==========================================================================
         # Add ACN
-        if self.acn > 0:
-            self.message('Adding acn noise')
-            pre_acn = copy(result)
+        pre_acn = copy(result)
+        if self.acn > 0 and 'alt_col_noise' not in skip:
+            self.message('Adding alt_col_noise noise')
             for op in np.arange(self.n_out):
 
                 # Generate new pink noise for each even and odd vector.
@@ -680,45 +749,66 @@ class HXRGNoise:
                 x1 = x0 + self.xsize
                 result[:, :, x0:x1] += acn_cube
 
-            # Save it
-            self.noise_sources['alt_col_noise'].append(self.noise_stats(result - pre_acn))
-            del acn_cube, pre_acn
+        else:
 
+            self.message('Skipping alt_col_noise')
+
+        # Save it
+        self.noise_sources['alt_col_noise'].append(self.noise_stats(result - pre_acn))
+        del pre_acn
+
+        # ==========================================================================
+        # pca0_noise ===============================================================
+        # ==========================================================================
         # Add PCA-zero. The PCA-zero template is modulated by 1/f.
-        if self.pca0_amp > 0:
-            self.message('Adding PCA-zero "picture frame" noise')
+        pre_pca0 = copy(result)
+        if self.pca0_amp > 0 and 'pca0_noise' not in skip:
+            self.message('Adding pca0_noise')
             gamma = self.pink_noise(mygen, mode='pink')
             zoom_factor = self.ncols * self.ngrps / np.size(gamma)
             gamma = zoom(gamma, zoom_factor, order=1, mode='mirror')
             gamma = np.reshape(gamma, (self.ngrps, self.ncols))
-            pre_pca0 = copy(result)
             for z in np.arange(self.ngrps):
                 for y in np.arange(self.ncols):
                     result[z, y, :] += self.pca0_amp * self.pca0[y, :] * gamma[z, y]
 
-            # Save it
-            self.noise_sources['pca0_noise'].append(self.noise_stats(result - pre_pca0))
-            del pre_pca0
+        else:
 
+            self.message('Skipping pca0_noise')
+
+        # Save it
+        self.noise_sources['pca0_noise'].append(self.noise_stats(result - pre_pca0))
+        del pre_pca0
+
+        # ==========================================================================
+        # pedestal_drift ===========================================================
+        # ==========================================================================
         # Add in channel offsets
-        if self.pedestal_drift > 0.:
-            self.message('Adding pedestal drift')
+        pre_drift = copy(result)
+        if self.pedestal_drift > 0. and 'pedestal_drift' not in skip:
+            self.message('Adding pedestal_drift')
             offsets = mygen.standard_normal((self.n_out, self.ngrps))
-            pre_drift = copy(result)
             for z in range(self.ngrps):
                 x0 = 0
                 for n in range(self.n_out):
-                    result[z, :, x0:x0 + self.xsize] = result[z, :, x0:x0 + self.xsize] + self.pedestal_drift * offsets[n, z]
-                    x0 = x0 + self.xsize
+                    result[z, :, x0:x0 + self.xsize] += self.pedestal_drift * offsets[n, z]
+                    x0 += self.xsize
 
-            # Save it
-            self.noise_sources['pedestal_drift'].append(self.noise_stats(result - pre_drift))
-            del pre_drift
+        else:
 
+            self.message('Skipping pedestal_drift')
+
+        # Save it
+        self.noise_sources['pedestal_drift'].append(self.noise_stats(result - pre_drift))
+        del pre_drift
+
+        # ==========================================================================
+        # dark_current =============================================================
+        # ==========================================================================
         # Add in dark current
-        if self.dark_current is not None:
-            self.message('Adding dark current')
-            pre_dark = copy(result)
+        pre_dark = copy(result)
+        if self.dark_current is not None and 'dark_current' not in skip:
+            self.message('Adding dark_current')
 
             # Generate dark current with Poisson distribution sampling
             dark = darkgen.poisson(self.dark_current, (self.ngrps, self.nrows, self.ncols))
@@ -729,31 +819,39 @@ class HXRGNoise:
             # Zero out reference pixels
             dark = add_refpix(dark)
 
-            # What's this for?
-            # for n1 in range(self.nrows):
-            #     for n2 in range(self.ncols):
-            #         values = darkgen.poisson(lam=self.dark_current[n1, n2], size=self.ngrps)
-            #         cvalues = np.cumsum(values)
-            #         result[:, n2, n1] = result[:, n2, n1] + cvalues
+            for n1 in range(self.nrows):
+                for n2 in range(self.ncols):
+                    values = darkgen.poisson(lam=self.dark_current[n1, n2], size=self.ngrps)
+                    cvalues = np.cumsum(values)
+                    result[:, n2, n1] += cvalues
 
             # Add dark current to data
-            result = result + np.transpose(dark, (0, 2, 1))
+            result += np.transpose(dark, (0, 2, 1))
 
-            # Save it
-            self.noise_sources['dark_current'].append(list(np.nanmean(result - pre_dark, axis=(1, 2))))
-            del pre_dark
+        else:
+
+            self.message('Skipping dark_current')
+
+        # Save it
+        self.noise_sources['dark_current'].append(list(np.nanmean(result - pre_dark, axis=(1, 2))))
+        del pre_dark
+
+        # ==========================================================================
+        # ==========================================================================
+        # ==========================================================================
 
         # If the data cube has only 1 frame, reformat into a 2-dimensional image
         if self.ngrps == 1:
             self.message('Reformatting cube into image')
             result = result[0, :, :]
 
-        if self.gain != 1:
-            result = result / self.gain
+        # Add gain
+        result /= self.gain
 
         # Transpose to (frame, nrows, ncols)
         result = np.transpose(result, (0, 2, 1))
 
+        # Add to integration count
         self.nints += 1
 
         return result
@@ -812,3 +910,73 @@ def make_photon_yield(photon_yield, orders):
     pyimage[np.where(sum2 == 0.)] = 1.
 
     return pyimage
+
+
+def nonLinFunc(image, coeffs, limits):
+    """
+    Apply linearity correction coefficients
+
+    Parameters
+    ----------
+    image
+    coeffs
+    limits
+
+    Returns
+    -------
+
+    """
+    # to image.
+    values = np.copy(image)
+    bady = 0
+    badx = 1
+    if len(image.shape) == 3:
+        bady = 1
+        badx = 2
+    elif len(image.shape) == 4:
+        bady = 2
+        badx = 3
+
+    bad = np.where(values > limits)
+    values[bad] = limits[bad[bady], bad[badx]]
+    ncoeff = coeffs.shape[0]
+    t = np.copy(coeffs[-1, :, :])
+    for i in range(ncoeff - 2, -1, -1):
+        t = coeffs[i, :, :] + values * t
+
+    return t
+
+
+def nonLinDeriv(image, coeffs, limits):
+    """
+    First derivative of non-lin correction
+
+    Parameters
+    ----------
+    image
+    coeffs
+    limits
+
+    Returns
+    -------
+
+    """
+    # function
+    values = np.copy(image)
+    bady = 0
+    badx = 1
+    if len(image.shape) == 3:
+        bady = 1
+        badx = 2
+    elif len(image.shape) == 4:
+        bady = 2
+        badx = 3
+
+    bad = np.where(values > limits)
+    values[bad] = limits[bad[bady], bad[badx]]
+    ncoeff = coeffs.shape[0]
+    t = (ncoeff - 1) * np.copy(coeffs[-1, :, :])
+    for i in range(ncoeff - 3, -1, -1):
+        t = (i + 1) * coeffs[i + 1, :, :] + values * t
+
+    return t

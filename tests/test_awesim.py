@@ -21,7 +21,8 @@ class test_ModelTSO(unittest.TestCase):
 
     def test_run_no_planet(self):
         """A test of the ModelTSO class with no planet"""
-        tso = ModelTSO()
+        tso = ModelTSO(stellar_model='ATLAS')
+        tso = ModelTSO(stellar_model='PHOENIX')
 
     def test_run_with_planet(self):
         """A test of the ModelTSO class with a planet"""
@@ -185,7 +186,7 @@ class test_TSO_verification(unittest.TestCase):
 
         self.assertEqual(tso2048clear.ngrps, 2)
         self.assertEqual(tso2048clear.nints, 2)
-        self.assertEqual(tso2048clear.nframes, 4)
+        self.assertEqual(tso2048clear.total_groups, 4)
         self.assertEqual(tso2048clear.dims, (2, 2, 2048, 2048))
         self.assertEqual(tso2048clear.subarray, 'FULL')
         self.assertEqual(tso2048clear.filter, 'CLEAR')
@@ -196,7 +197,7 @@ class test_TSO_verification(unittest.TestCase):
 
         self.assertEqual(tso256clear.ngrps, 2)
         self.assertEqual(tso256clear.nints, 2)
-        self.assertEqual(tso256clear.nframes, 4)
+        self.assertEqual(tso256clear.total_groups, 4)
         self.assertEqual(tso256clear.dims, (2, 2, 256, 2048))
         self.assertEqual(tso256clear.subarray, 'SUBSTRIP256')
         self.assertEqual(tso256clear.filter, 'CLEAR')
@@ -207,7 +208,7 @@ class test_TSO_verification(unittest.TestCase):
 
         self.assertEqual(tso96clear.ngrps, 2)
         self.assertEqual(tso96clear.nints, 2)
-        self.assertEqual(tso96clear.nframes, 4)
+        self.assertEqual(tso96clear.total_groups, 4)
         self.assertEqual(tso96clear.dims, (2, 2, 96, 2048))
         self.assertEqual(tso96clear.subarray, 'SUBSTRIP96')
         self.assertEqual(tso96clear.filter, 'CLEAR')
@@ -218,7 +219,7 @@ class test_TSO_verification(unittest.TestCase):
 
         self.assertEqual(tso2048f277w.ngrps, 2)
         self.assertEqual(tso2048f277w.nints, 2)
-        self.assertEqual(tso2048f277w.nframes, 4)
+        self.assertEqual(tso2048f277w.total_groups, 4)
         self.assertEqual(tso2048f277w.dims, (2, 2, 2048, 2048))
         self.assertEqual(tso2048f277w.subarray, 'FULL')
         self.assertEqual(tso2048f277w.filter, 'F277W')
@@ -229,7 +230,7 @@ class test_TSO_verification(unittest.TestCase):
 
         self.assertEqual(tso256f277w.ngrps, 2)
         self.assertEqual(tso256f277w.nints, 2)
-        self.assertEqual(tso256f277w.nframes, 4)
+        self.assertEqual(tso256f277w.total_groups, 4)
         self.assertEqual(tso256f277w.dims, (2, 2, 256, 2048))
         self.assertEqual(tso256f277w.subarray, 'SUBSTRIP256')
         self.assertEqual(tso256f277w.filter, 'F277W')
@@ -240,7 +241,7 @@ class test_TSO_verification(unittest.TestCase):
 
         self.assertEqual(tso96f277w.ngrps, 2)
         self.assertEqual(tso96f277w.nints, 2)
-        self.assertEqual(tso96f277w.nframes, 4)
+        self.assertEqual(tso96f277w.total_groups, 4)
         self.assertEqual(tso96f277w.dims, (2, 2, 96, 2048))
         self.assertEqual(tso96f277w.subarray, 'SUBSTRIP96')
         self.assertEqual(tso96f277w.filter, 'F277W')

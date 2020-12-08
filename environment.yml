@@ -20,7 +20,7 @@ dependencies:
   - webbpsf-data=0.8.0
   - pip:
     - asteval==0.9.14
-    - astroquery=0.4.1
+    - astroquery==0.4.1
     - awesimsoss==0.3.5
     - batman-package==2.4.6
     - bibtexparser==1.2.0

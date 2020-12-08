@@ -43,12 +43,6 @@ The best way to install ``awesimsoss`` is
 
 .. code-block:: bash
 
-   conda install -c jfilippazzo awesimsoss
-
-You can also do it with
-
-.. code-block:: bash
-
    git clone https://github.com/spacetelescope/awesimsoss.git
    cd awesimsoss
    conda env create --name awesimsoss -f environment.yml
